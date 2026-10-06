@@ -5,10 +5,16 @@
 - 读取永远只来自工作区指针指向的「已发布」纪元；候选纪元从不对外提供读取，
   因此读结果只能是完整旧纪元或完整新纪元。
 - 迁移状态存放在工作区行上（唯一槽位），并发迁移不可能创建第二个候选纪元。
+- 每次迁移拥有全局唯一的 migration_id，其冻结清单（manifest）按迁移绑定到
+  「本工作区 + 发起时的源纪元」：多个工作区升级到同一目标版本也各自携带自己
+  发起时冻结的完整记录，绝不共享清单。
 - 迁移协议：复制到候选纪元 -> 校验 -> 单事务原子发布（切换指针 + 作废旧纪元
   + 失效旧页面一次提交）。发布前后，旧页面的迟到保存一律被拒绝并提示重新载入。
 - 页面在复制/校验/发布之间关闭时，依据持久化阶段恢复：
   复制中 -> 安全回收候选；校验中 -> 保留同一候选等待续用；发布中 -> 立即完成发布。
+- 启动恢复还会收敛已发布纪元：若新纪元冻结段与本工作区源纪元快照不一致（例如
+  旧版本缺陷使工作区误读到他区清单），按源纪元冻结快照校正，顺序/内容/时间
+  原样保留，迁移后新增记录顺延不丢失；纪元不回退，旧页面不恢复写入资格。
 """
 
 from __future__ import annotations
@@ -35,6 +41,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
   current_epoch_id TEXT,
   -- 迁移唯一槽位：同一工作区至多一个进行中的迁移，天然杜绝第二个候选纪元
   migration_phase TEXT NOT NULL DEFAULT 'idle',
+  migration_id TEXT,                    -- 本次迁移的全局唯一标识（绑定冻结清单）
   migration_target_version TEXT,
   migration_candidate_epoch_id TEXT,
   migration_source_epoch_id TEXT,
@@ -43,7 +50,8 @@ CREATE TABLE IF NOT EXISTS workspaces (
   migration_total INTEGER NOT NULL DEFAULT 0,
   migration_started_at TEXT,
   migration_updated_at TEXT,
-  migration_error TEXT
+  migration_error TEXT,
+  published_frozen_count INTEGER              -- 已发布纪元冻结段长度；NULL=遗留发布待对账
 );
 CREATE TABLE IF NOT EXISTS epochs (
   id TEXT PRIMARY KEY,
@@ -64,12 +72,17 @@ CREATE TABLE IF NOT EXISTS records (
 );
 CREATE INDEX IF NOT EXISTS idx_records_epoch ON records(epoch_id, seq);
 CREATE TABLE IF NOT EXISTS migration_manifests (
-  target_version TEXT PRIMARY KEY,
+  -- 每次迁移一行：migration_id 全局唯一，清单只属于发起时的（工作区, 源纪元）。
+  -- 同一目标版本可被多个工作区并行使用，彼此不共享冻结记录。
+  migration_id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  target_version TEXT NOT NULL,
   source_epoch_id TEXT NOT NULL,
   record_count INTEGER NOT NULL,
   record_checksum TEXT NOT NULL,
   records_json TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  UNIQUE (workspace_id, target_version)
 );
 CREATE TABLE IF NOT EXISTS pages (
   id TEXT PRIMARY KEY,
@@ -118,6 +131,7 @@ class Store:
         self.conn.execute("PRAGMA busy_timeout=5000")
         with self._lock:
             self.conn.executescript(SCHEMA)
+            self._migrate_schema_locked()
         # 进程重启 = 所有页面连接已断开：关闭遗留活动页面并恢复未完成的迁移
         self.recover_all()
 
@@ -173,25 +187,121 @@ class Store:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def _manifest_locked(self, target_version: str) -> sqlite3.Row | None:
+    # ------------------------------------------------- 旧版本库结构升级与数据收敛
+
+    def _column_names_locked(self, table: str) -> set[str]:
+        return {r["name"] for r in self.conn.execute(
+            f"PRAGMA table_info({table})").fetchall()}
+
+    def _migrate_schema_locked(self):
+        """把旧版本库升级到当前结构。
+
+        旧表 migration_manifests 仅按 target_version 存一行，多个工作区迁移到
+        同一版本时共享了首个工作区的冻结清单；workspaces 也没有 migration_id。
+        升级时按（工作区, 目标版本）重建清单：能与现存源纪元对上的保留，对不上
+        的（已被跨区污染的发布）在 recover_all 中依据源纪元收敛。
+        """
+        ws_cols = self._column_names_locked("workspaces")
+        if "migration_id" not in ws_cols:
+            self.conn.execute("ALTER TABLE workspaces ADD COLUMN migration_id TEXT")
+        if "published_frozen_count" not in ws_cols:
+            # 遗留已发布纪元一律置 NULL：等待与本工作区源冻结快照对账收敛
+            self.conn.execute(
+                "ALTER TABLE workspaces ADD COLUMN published_frozen_count INTEGER")
+
+        mcols = self._column_names_locked("migration_manifests")
+        if "migration_id" in mcols and "workspace_id" in mcols:
+            return  # 已是当前结构
+
+        old_rows = self.conn.execute(
+            "SELECT target_version, source_epoch_id, record_count, record_checksum, "
+            "records_json, created_at FROM migration_manifests"
+        ).fetchall()
+        self.conn.execute("DROP TABLE migration_manifests")
+        self.conn.execute(
+            "CREATE TABLE migration_manifests ("
+            "migration_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, "
+            "target_version TEXT NOT NULL, source_epoch_id TEXT NOT NULL, "
+            "record_count INTEGER NOT NULL, record_checksum TEXT NOT NULL, "
+            "records_json TEXT NOT NULL, created_at TEXT NOT NULL, "
+            "UNIQUE (workspace_id, target_version))")
+        ws_rows = self.conn.execute(
+            "SELECT id, migration_phase, migration_target_version AS tv, "
+            "migration_source_epoch_id AS src, migration_candidate_epoch_id AS cand "
+            "FROM workspaces").fetchall()
+        by_target: dict[str, list[sqlite3.Row]] = {}
+        for w in ws_rows:
+            if w["tv"]:
+                by_target.setdefault(w["tv"], []).append(w)
+        for m in old_rows:
+            tv = m["target_version"]
+            owners = by_target.get(tv, [])
+            # 源纪元与清单吻合的工作区是这份冻结清单的真正主人
+            owner = next((w for w in owners if w["src"] == m["source_epoch_id"]), None)
+            if owner is None and len(owners) == 1:
+                owner = owners[0]  # 源纪元可能已被清理，唯一持有者认领
+            if owner is None:
+                continue  # 无主的跨区共享清单直接丢弃
+            mid = new_id("mig")
+            self.conn.execute(
+                "INSERT INTO migration_manifests(migration_id,workspace_id,target_version,"
+                "source_epoch_id,record_count,record_checksum,records_json,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (mid, owner["id"], tv, m["source_epoch_id"], m["record_count"],
+                 m["record_checksum"], m["records_json"], m["created_at"]))
+            self.conn.execute(
+                "UPDATE workspaces SET migration_id=? WHERE id=?", (mid, owner["id"]))
+
+        # 用错清单（源纪元对不上）的在途迁移携带的是他区记录。复制中的会由
+        # recover_all 按既有规则回收；校验中/待发布必须在此拦截，否则会通过校验
+        # 并原子发布出他区记录。
+        for w in ws_rows:
+            if w["migration_phase"] not in ("validating", "publishing") or not w["tv"]:
+                continue
+            manifest = self.conn.execute(
+                "SELECT * FROM migration_manifests WHERE workspace_id=? AND target_version=?",
+                (w["id"], w["tv"]),
+            ).fetchone()
+            mismatch = manifest is None or manifest["source_epoch_id"] != w["src"]
+            if mismatch:
+                if w["cand"]:
+                    self.conn.execute("DELETE FROM records WHERE epoch_id=?", (w["cand"],))
+                    self.conn.execute("DELETE FROM epochs WHERE id=?", (w["cand"],))
+                self.conn.execute(
+                    "UPDATE workspaces SET migration_phase='aborted', "
+                    "migration_candidate_epoch_id=NULL, migration_source_epoch_id=NULL, "
+                    "migration_owner_page_id=NULL, migration_copied=0, migration_total=0, "
+                    "migration_error=? WHERE id=?",
+                    ("升级后发现迁移清单与本工作区不匹配，候选纪元已安全回收", w["id"]))
+                continue
+            if w["migration_phase"] == "publishing" and w["cand"]:
+                count, checksum = self._checksum(w["cand"])
+                if (count, checksum) != (manifest["record_count"], manifest["record_checksum"]):
+                    self.conn.execute(
+                        "UPDATE workspaces SET migration_phase='failed', "
+                        "migration_error=? WHERE id=?",
+                        ("升级后发布前复核不一致，已中止发布", w["id"]))
+
+    # ---------------------------------------------------------------- 冻结清单
+
+    def _manifest_for_locked(self, ws_id: str, migration_id: str) -> sqlite3.Row | None:
         return self.conn.execute(
-            "SELECT * FROM migration_manifests WHERE target_version=?", (target_version,)
+            "SELECT * FROM migration_manifests WHERE migration_id=? AND workspace_id=?",
+            (migration_id, ws_id),
         ).fetchone()
 
-    def _ensure_manifest_locked(self, source_epoch_id: str, target_version: str) -> sqlite3.Row:
-        manifest = self._manifest_locked(target_version)
-        if manifest is not None:
-            return manifest
+    def _create_manifest_locked(self, ws_id: str, migration_id: str,
+                                source_epoch_id: str, target_version: str) -> sqlite3.Row:
         snapshot = self._snapshot_records(source_epoch_id)
         count, checksum = self._checksum(source_epoch_id)
         self.conn.execute(
-            "INSERT INTO migration_manifests("
-            "target_version,source_epoch_id,record_count,record_checksum,records_json,created_at) "
-            "VALUES(?,?,?,?,?,?)",
-            (target_version, source_epoch_id, count, checksum,
+            "INSERT INTO migration_manifests(migration_id,workspace_id,target_version,"
+            "source_epoch_id,record_count,record_checksum,records_json,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (migration_id, ws_id, target_version, source_epoch_id, count, checksum,
              json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")), utcnow()),
         )
-        manifest = self._manifest_locked(target_version)
+        manifest = self._manifest_for_locked(ws_id, migration_id)
         assert manifest is not None
         return manifest
 
@@ -227,6 +337,9 @@ class Store:
                 owner = self._page(ws["migration_owner_page_id"])
                 if owner is None or owner["state"] != "active":
                     self._recover_locked(ws)
+            elif ws["migration_phase"] == "published":
+                # 每次打开/心跳也做一次幂等对账：受污染已发布工作区安全收敛
+                self._reconcile_published_locked(ws)
 
     def _recover_locked(self, ws: sqlite3.Row):
         """依据持久化阶段恢复：复制中->回收候选；校验中->续用同一候选；发布中->完成发布。"""
@@ -255,6 +368,99 @@ class Store:
             # 发布事务未提交即中断：候选已校验，恢复时把发布补齐（幂等）
             self._publish_locked(ws)
 
+    def _frozen_reference_locked(self, ws: sqlite3.Row) -> list[dict] | None:
+        """本次已发布迁移应携带的冻结段（本工作区发起时源纪元的完整快照）。"""
+        if ws["migration_id"]:
+            manifest = self._manifest_for_locked(ws["id"], ws["migration_id"])
+            # 清单的源纪元必须就是本工作区行记录的源，否则不采信（旧库升级兜底）
+            if manifest is not None and \
+                    manifest["source_epoch_id"] == ws["migration_source_epoch_id"]:
+                return self._manifest_records(manifest)
+        # 无清单可查：直接从仍然留存的、本工作区的源纪元取冻结快照
+        src_id = ws["migration_source_epoch_id"]
+        if src_id:
+            src = self.conn.execute(
+                "SELECT id FROM epochs WHERE id=? AND workspace_id=?",
+                (src_id, ws["id"]),
+            ).fetchone()
+            if src is not None:
+                return self._snapshot_records(src_id)
+        return None
+
+    def _reconcile_published_locked(self, ws: sqlite3.Row) -> bool:
+        """已发布纪元与本工作区冻结快照对账；被跨区污染时安全收敛。
+
+        返回是否发生了修复。修复只重写冻结段：顺序/内容/时间按源快照逐字恢复，
+        迁移后新增记录顺延保留；纪元指针不回退，旧页面不复活，仍打开的页面失效
+        以强制重新载入。
+        """
+        if ws["migration_phase"] != "published" or not ws["current_epoch_id"]:
+            return False
+        # 已对账/修复后代码发布的纪元（计数可能为 0）直接放行；只有遗留发布需收敛
+        if ws["published_frozen_count"] is not None:
+            return False
+        frozen = self._frozen_reference_locked(ws)
+        if frozen is None:
+            return False
+        cur_id = ws["current_epoch_id"]
+        rows = self.conn.execute(
+            "SELECT seq, content, created_at FROM records WHERE epoch_id=? ORDER BY seq",
+            (cur_id,),
+        ).fetchall()
+        current = [dict(r) for r in rows]
+        frozen_n = len(frozen)
+        # 复制步骤实际写入的条数持久化在 migration_total：冻结副本严格占据
+        # seq 1..total，发布后新增只能接在其后。这比时间戳边界可靠（毫秒精度下
+        # 迁移发起与新增时间戳可能相同），且能正确处理他区清单更长/更短的情形。
+        total = ws["migration_total"] if ws["migration_total"] is not None else frozen_n
+        copied_part = current[:total]
+        tail = current[total:]
+
+        def healthy() -> bool:
+            # 条数对不上（他区清单长度不同）或冻结段任一记录顺序/内容/时间不符
+            if total != frozen_n or len(copied_part) != frozen_n:
+                return False
+            for i, want in enumerate(frozen):
+                got = copied_part[i]
+                if got["seq"] != i + 1 or got["content"] != want["content"] \
+                        or got["created_at"] != want["created_at"]:
+                    return False
+            return True
+
+        if healthy():
+            self.conn.execute(
+                "UPDATE workspaces SET published_frozen_count=? WHERE id=?",
+                (frozen_n, ws["id"]))
+            return False
+
+        now = utcnow()
+        # 调用方始终持有事务（recover_all / _maintenance_locked），整段修复原子提交
+        self.conn.execute("DELETE FROM records WHERE epoch_id=?", (cur_id,))
+        for i, r in enumerate(frozen):
+            self.conn.execute(
+                "INSERT INTO records(id,workspace_id,epoch_id,seq,content,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (new_id("rec"), ws["id"], cur_id, i + 1, r["content"], r["created_at"]),
+            )
+        for j, r in enumerate(tail):
+            self.conn.execute(
+                "INSERT INTO records(id,workspace_id,epoch_id,seq,content,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (new_id("rec"), ws["id"], cur_id, frozen_n + j + 1,
+                 r["content"], r["created_at"]),
+            )
+        # 仍以为当前内容有效的活动页面必须重新载入；旧页面绝不因此复活
+        self.conn.execute(
+            "UPDATE pages SET state='invalidated', invalidated_at=? "
+            "WHERE workspace_id=? AND state='active' AND epoch_id=?",
+            (now, ws["id"], cur_id),
+        )
+        self.conn.execute(
+            "UPDATE workspaces SET published_frozen_count=?, migration_updated_at=? WHERE id=?",
+            (frozen_n, now, ws["id"]),
+        )
+        return True
+
     def recover_all(self):
         """进程启动时调用：上一生命周期的页面全部视为已关闭，并恢复所有迁移。"""
         with self._lock:
@@ -263,11 +469,16 @@ class Store:
                     "UPDATE pages SET state='closed', closed_at=? WHERE state='active'",
                     (utcnow(),),
                 )
-                rows = self.conn.execute(
-                    "SELECT * FROM workspaces WHERE migration_phase IN ('copying','validating','publishing')"
-                ).fetchall()
+                rows = self.conn.execute("SELECT * FROM workspaces").fetchall()
                 for ws in rows:
-                    self._recover_locked(ws)
+                    if ws["migration_phase"] in ACTIVE_PHASES:
+                        self._recover_locked(ws)
+                    elif ws["migration_phase"] == "published":
+                        # 收敛旧版本可能已发布的跨区污染（幂等，无偏差时不动数据）
+                        ws = self._ws(ws["id"])
+                        if self._reconcile_published_locked(ws):
+                            print(f"[db] 工作区 {ws['id']} 已发布纪元与源冻结快照不一致，"
+                                  "已按本工作区记录安全收敛", flush=True)
 
     # ---------------------------------------------------------------- 工作区
 
@@ -414,7 +625,7 @@ class Store:
                     raise ApiError(409, "migration_active",
                                    "已有进行中的迁移，不会创建第二个候选纪元")
                 self._require_driver(ws, self._page(page_id))
-                # 上一次 failed 遗留的候选先回收
+                # 上一次 failed/aborted 遗留的候选先回收
                 old_cand = ws["migration_candidate_epoch_id"]
                 if old_cand:
                     self.conn.execute("DELETE FROM records WHERE epoch_id=?", (old_cand,))
@@ -430,15 +641,24 @@ class Store:
                     "VALUES(?,?,?,?,'candidate',?)",
                     (cand_id, ws_id, number, target_version, now),
                 )
-                manifest = self._ensure_manifest_locked(ws["current_epoch_id"], target_version)
+                # 每次迁移一个全局唯一 ID，并在「此刻」冻结本工作区当前纪元的完整记录。
+                # 同目标版本的旧清单（上次失败/重试）先作废，绝不复用过时快照。
+                migration_id = new_id("mig")
+                self.conn.execute(
+                    "DELETE FROM migration_manifests WHERE workspace_id=? AND target_version=?",
+                    (ws_id, target_version),
+                )
+                manifest = self._create_manifest_locked(
+                    ws_id, migration_id, ws["current_epoch_id"], target_version)
                 total = manifest["record_count"]
                 self.conn.execute(
-                    "UPDATE workspaces SET migration_phase='copying', migration_target_version=?, "
-                    "migration_candidate_epoch_id=?, migration_source_epoch_id=?, "
-                    "migration_owner_page_id=?, migration_copied=0, migration_total=?, "
+                    "UPDATE workspaces SET migration_phase='copying', migration_id=?, "
+                    "migration_target_version=?, migration_candidate_epoch_id=?, "
+                    "migration_source_epoch_id=?, migration_owner_page_id=?, "
+                    "migration_copied=0, migration_total=?, "
                     "migration_started_at=?, migration_updated_at=?, migration_error=NULL "
                     "WHERE id=?",
-                    (target_version, cand_id, ws["current_epoch_id"], page_id,
+                    (migration_id, target_version, cand_id, ws["current_epoch_id"], page_id,
                      total, now, now, ws_id),
                 )
         return self.get_state(ws_id)
@@ -464,9 +684,13 @@ class Store:
                     (page_id, ws_id))
                 cand = ws["migration_candidate_epoch_id"]
                 copied = ws["migration_copied"]
-                manifest = self._manifest_locked(ws["migration_target_version"])
+                manifest = self._manifest_for_locked(ws_id, ws["migration_id"])
                 if manifest is None:
                     raise ApiError(409, "manifest_missing", "迁移复制清单不存在，无法继续复制")
+                # 清单必须属于本工作区的本次迁移：杜绝跨工作区复用同版本清单
+                if manifest["source_epoch_id"] != ws["migration_source_epoch_id"]:
+                    raise ApiError(409, "manifest_mismatch",
+                                   "迁移复制清单与源纪元不匹配，请重新发起迁移")
                 records = self._manifest_records(manifest)
                 rows = records[copied:copied + batch_size]
                 for r in rows:
@@ -499,9 +723,12 @@ class Store:
                 self.conn.execute(
                     "UPDATE workspaces SET migration_owner_page_id=? WHERE id=?",
                     (page_id, ws_id))
-                manifest = self._manifest_locked(ws["migration_target_version"])
+                manifest = self._manifest_for_locked(ws_id, ws["migration_id"])
                 if manifest is None:
                     raise ApiError(409, "manifest_missing", "迁移复制清单不存在，无法校验")
+                if manifest["source_epoch_id"] != ws["migration_source_epoch_id"]:
+                    raise ApiError(409, "manifest_mismatch",
+                                   "迁移复制清单与源纪元不匹配，请重新发起迁移")
                 src_sum = (manifest["record_count"], manifest["record_checksum"])
                 cand_sum = self._checksum(ws["migration_candidate_epoch_id"])
                 now = utcnow()
@@ -542,11 +769,17 @@ class Store:
         if not cand:
             return False
         now = utcnow()
-        # 发布前复核：候选必须与源纪元一致，否则标记失败而不是发布半成品
-        manifest = self._manifest_locked(ws["migration_target_version"])
-        expected = ((manifest["record_count"], manifest["record_checksum"])
-                    if manifest is not None else None)
-        if expected is None or self._checksum(cand) != expected:
+        # 发布前复核：候选必须与本工作区本次迁移的冻结清单一致，否则失败而非发布半成品
+        manifest = self._manifest_for_locked(ws["id"], ws["migration_id"])
+        if manifest is None or manifest["source_epoch_id"] != ws["migration_source_epoch_id"]:
+            self.conn.execute(
+                "UPDATE workspaces SET migration_phase='failed', migration_error=?, "
+                "migration_updated_at=? WHERE id=?",
+                ("发布前复核发现迁移清单与本工作区不匹配，已中止发布", now, ws["id"]),
+            )
+            return False
+        expected = (manifest["record_count"], manifest["record_checksum"])
+        if self._checksum(cand) != expected:
             self.conn.execute(
                 "UPDATE workspaces SET migration_phase='failed', migration_error=?, "
                 "migration_updated_at=? WHERE id=?",
@@ -564,8 +797,8 @@ class Store:
         self.conn.execute(
             "UPDATE workspaces SET current_epoch_id=?, migration_phase='published', "
             "migration_candidate_epoch_id=NULL, migration_owner_page_id=NULL, "
-            "migration_error=NULL, migration_updated_at=? WHERE id=?",
-            (cand, now, ws["id"]),
+            "migration_error=NULL, published_frozen_count=?, migration_updated_at=? WHERE id=?",
+            (cand, manifest["record_count"], now, ws["id"]),
         )
         return True
 

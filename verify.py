@@ -4,7 +4,9 @@
 步骤穿插执行：构建检查 -> 代码测试 -> 健康/页面 HTTP 冒烟 -> API 冒烟 ->
 场景一（两页面迁移 + 旧写拒绝 + 并发迁移不建第二候选）->
 场景二（复制中断重开不展示部分数据 + 校验阶段续用同一候选）->
-场景三（发布后进程重启，本地恢复的纪元/记录/失效状态一致）。
+场景三（两工作区同一目标版本的顺序与交叠迁移，各自发布记录完全隔离）->
+场景四（`POST /api/admin/shutdown` 触发进程退出，编排层按 `restart: unless-stopped`
+拉起后，校验本地恢复的纪元/记录/失效状态一致）。
 
 用法：
   python verify.py [--base-url http://app:8000] [--no-restart]
@@ -264,7 +266,115 @@ def scenario_interruption_recovery(ctx):
 
 # ---------------------------------------------------------------- 场景三
 
-@step("场景三：发布后进程重启，本地恢复的纪元/记录/失效状态一致")
+def _drive_migration(ctx, ws, page, version, batch_size=2):
+    """发起 -> 复制 -> 校验 -> 发布，返回最终状态。"""
+    req(ctx, "POST", f"/api/workspaces/{ws}/migration/start",
+        {"page_id": page, "target_version": version}, expect=200)
+    while True:
+        _, s = req(ctx, "POST", f"/api/workspaces/{ws}/migration/copy",
+                   {"page_id": page, "batch_size": batch_size}, expect=200)
+        if s["migration"]["phase"] == "validating":
+            break
+    req(ctx, "POST", f"/api/workspaces/{ws}/migration/validate",
+        {"page_id": page}, expect=200)
+    _, s = req(ctx, "POST", f"/api/workspaces/{ws}/migration/publish",
+               {"page_id": page}, expect=200)
+    return s
+
+
+def _new_workspace(ctx, name, contents):
+    ws = req(ctx, "POST", "/api/workspaces", {"name": name}, expect=201)[1]["id"]
+    page = req(ctx, "POST", f"/api/workspaces/{ws}/pages", expect=201)[1]["page_id"]
+    for c in contents:
+        req(ctx, "POST", f"/api/workspaces/{ws}/records",
+            {"page_id": page, "content": c}, expect=201)
+    _, state = req(ctx, "GET", f"/api/workspaces/{ws}/state", expect=200)
+    return ws, page, state
+
+
+@step("场景三：两工作区同目标版本的顺序与交叠迁移，发布记录完全隔离")
+def scenario_two_workspaces_same_version(ctx):
+    tag = uuid.uuid4().hex[:8]
+    a_records = [f"甲-{tag}-{i}" for i in range(1, 4)]
+    b_records = [f"乙-{tag}-{i}" for i in range(1, 3)]
+    ws_a, page_a, state_a0 = _new_workspace(ctx, f"验收甲-{tag}", a_records)
+    ws_b, page_b, state_b0 = _new_workspace(ctx, f"验收乙-{tag}", b_records)
+    a_snap0 = [(r["seq"], r["content"], r["created_at"]) for r in state_a0["records"]]
+    b_snap0 = [(r["seq"], r["content"], r["created_at"]) for r in state_b0["records"]]
+
+    # —— 顺序迁移：甲先发布同一目标版本，乙随后 ——
+    target = f"v-seq-{tag}"
+    sa = _drive_migration(ctx, ws_a, page_a, target)
+    check(sa["current_epoch"]["version"] == target, "甲目标版本不符")
+    sb = _drive_migration(ctx, ws_b, page_b, target)
+    check(sb["current_epoch"]["version"] == target, "乙目标版本不符")
+    check([(r["content"]) for r in sa["records"]] == a_records,
+          f"甲发布后读到他区记录: {[r['content'] for r in sa['records']]}")
+    check([(r["content"]) for r in sb["records"]] == b_records,
+          f"乙发布后丢失自身记录/读到甲记录: {[r['content'] for r in sb['records']]}")
+
+    # 顺序/内容/时间信息：各自新纪元冻结段与自身发起时快照逐条一致
+    _, sa = req(ctx, "GET", f"/api/workspaces/{ws_a}/state", expect=200)
+    _, sb = req(ctx, "GET", f"/api/workspaces/{ws_b}/state", expect=200)
+    check([(r["seq"], r["content"], r["created_at"]) for r in sa["records"]] == a_snap0,
+          "甲新纪元顺序/内容/时间与冻结快照不一致")
+    check([(r["seq"], r["content"], r["created_at"]) for r in sb["records"]] == b_snap0,
+          "乙新纪元顺序/内容/时间与冻结快照不一致")
+
+    # —— 交叠迁移：两工作区同时进行，复制批次交叉穿插，再各自发布 ——
+    page_a2 = req(ctx, "POST", f"/api/workspaces/{ws_a}/pages", expect=201)[1]["page_id"]
+    page_b2 = req(ctx, "POST", f"/api/workspaces/{ws_b}/pages", expect=201)[1]["page_id"]
+    target2 = f"v-ovl-{tag}"
+    req(ctx, "POST", f"/api/workspaces/{ws_a}/migration/start",
+        {"page_id": page_a2, "target_version": target2}, expect=200)
+    req(ctx, "POST", f"/api/workspaces/{ws_b}/migration/start",
+        {"page_id": page_b2, "target_version": target2}, expect=200)
+
+    # 交叉复制：甲一批、乙一批，直到双方都进入校验（记录数不同也能收敛）
+    def one_copy(ws, page):
+        return req(ctx, "POST", f"/api/workspaces/{ws}/migration/copy",
+                   {"page_id": page, "batch_size": 1}, expect=200)[1]["migration"]
+
+    sa_m = {"phase": "copying"}
+    sb_m = {"phase": "copying"}
+    while sa_m["phase"] != "validating" or sb_m["phase"] != "validating":
+        if sa_m["phase"] == "copying":
+            sa_m = one_copy(ws_a, page_a2)
+        if sb_m["phase"] == "copying":
+            sb_m = one_copy(ws_b, page_b2)
+    req(ctx, "POST", f"/api/workspaces/{ws_a}/migration/validate",
+        {"page_id": page_a2}, expect=200)
+    req(ctx, "POST", f"/api/workspaces/{ws_b}/migration/validate",
+        {"page_id": page_b2}, expect=200)
+    req(ctx, "POST", f"/api/workspaces/{ws_a}/migration/publish",
+        {"page_id": page_a2}, expect=200)
+    req(ctx, "POST", f"/api/workspaces/{ws_b}/migration/publish",
+        {"page_id": page_b2}, expect=200)
+
+    _, sa = req(ctx, "GET", f"/api/workspaces/{ws_a}/state", expect=200)
+    _, sb = req(ctx, "GET", f"/api/workspaces/{ws_b}/state", expect=200)
+    check(sa["current_epoch"]["version"] == target2 and sb["current_epoch"]["version"] == target2,
+          "交叠迁移后双方版本均应为目标版本")
+    check([r["content"] for r in sa["records"]] == a_records,
+          "交叠发布后甲记录被污染")
+    check([r["content"] for r in sb["records"]] == b_records,
+          "交叠发布后乙记录被污染")
+
+    # 迁移后新增只写入本工作区；重开读取互不串扰
+    page_a3 = req(ctx, "POST", f"/api/workspaces/{ws_a}/pages", expect=201)[1]["page_id"]
+    req(ctx, "POST", f"/api/workspaces/{ws_a}/records",
+        {"page_id": page_a3, "content": f"甲新增-{tag}"}, expect=201)
+    _, sa = req(ctx, "GET", f"/api/workspaces/{ws_a}/state", expect=200)
+    _, sb = req(ctx, "GET", f"/api/workspaces/{ws_b}/state", expect=200)
+    check([r["content"] for r in sa["records"]] == a_records + [f"甲新增-{tag}"],
+          "甲迁移后新增丢失")
+    check([r["content"] for r in sb["records"]] == b_records,
+          "乙不应读到甲的迁移后新增")
+
+
+# ---------------------------------------------------------------- 场景三
+
+@step("场景四：发布后进程重启，本地恢复的纪元/记录/失效状态一致")
 def scenario_restart_consistency(ctx):
     if ctx["no_restart"]:
         print("[verify] 跳过（--no-restart）")
@@ -304,6 +414,7 @@ def main():
     print(f"[verify] 目标 {ctx['base']}", flush=True)
     steps = [build_check, unit_tests, smoke_health, smoke_pages, smoke_api,
              scenario_stale_write_rejected, scenario_interruption_recovery,
+             scenario_two_workspaces_same_version,
              scenario_restart_consistency]
     for s in steps:
         s(ctx)
