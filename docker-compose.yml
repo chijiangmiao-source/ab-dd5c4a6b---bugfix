@@ -29,7 +29,9 @@ services:
     environment:
       BASE_URL: http://app:8000
     command: ["python", "verify.py"]
-    # 不配置重启策略：跑完自行退出，以退出码报告结果
+    # 显式不重启：验收只执行一次，跑完自行退出，编排以其退出码为结果
+    # （up --exit-code-from verify --abort-on-container-exit）
+    restart: "no"
 
 volumes:
   app-data:

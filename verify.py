@@ -4,7 +4,9 @@
 步骤穿插执行：构建检查 -> 代码测试 -> 健康/页面 HTTP 冒烟 -> API 冒烟 ->
 场景一（两页面迁移 + 旧写拒绝 + 并发迁移不建第二候选）->
 场景二（复制中断重开不展示部分数据 + 校验阶段续用同一候选）->
-场景三（发布后进程重启，本地恢复的纪元/记录/失效状态一致）。
+场景三（发布后进程重启，本地恢复的纪元/记录/失效状态一致）->
+场景四（两个工作区使用同一目标版本的顺序与交叠迁移，各自发布记录完全隔离，
+顺序/内容/时间信息保留，先完成的工作区及其纪元不被后一个工作区改变）。
 
 用法：
   python verify.py [--base-url http://app:8000] [--no-restart]
@@ -262,6 +264,108 @@ def scenario_interruption_recovery(ctx):
     check(len(s["records"]) == 6, "新纪元记录应完整")
 
 
+# ---------------------------------------------------------------- 场景四
+
+def _migrate_full(ctx, ws, page, version, batch=2):
+    """发起并完成一次迁移，返回最终工作区状态。"""
+    req(ctx, "POST", f"/api/workspaces/{ws}/migration/start",
+        {"page_id": page, "target_version": version}, expect=200)
+    while True:
+        _, s = req(ctx, "POST", f"/api/workspaces/{ws}/migration/copy",
+                   {"page_id": page, "batch_size": batch}, expect=200)
+        if s["migration"]["phase"] == "validating":
+            break
+    req(ctx, "POST", f"/api/workspaces/{ws}/migration/validate",
+        {"page_id": page}, expect=200)
+    _, s = req(ctx, "POST", f"/api/workspaces/{ws}/migration/publish",
+               {"page_id": page}, expect=200)
+    return s
+
+
+def _new_workspace(ctx, name, contents):
+    code, ws = req(ctx, "POST", "/api/workspaces", {"name": name}, expect=201)
+    page = req(ctx, "POST", f"/api/workspaces/{ws['id']}/pages", expect=201)[1]["page_id"]
+    for c in contents:
+        req(ctx, "POST", f"/api/workspaces/{ws['id']}/records",
+            {"page_id": page, "content": c}, expect=201)
+    _, state = req(ctx, "GET", f"/api/workspaces/{ws['id']}/state", expect=200)
+    return ws["id"], page, state
+
+
+def _recs_triples(state):
+    return [(r["seq"], r["content"], r["created_at"]) for r in state["records"]]
+
+
+@step("场景四：两个工作区以同一目标版本顺序与交叠迁移，发布记录完全隔离")
+def scenario_same_target_isolation(ctx):
+    stamp = uuid.uuid4().hex[:8]
+
+    # —— 顺序迁移：工作区A先迁移到 vX，完成后工作区B再迁移到同一 vX ——
+    a_contents = [f"甲台冻结-{stamp}-{i}" for i in range(1, 4)]
+    b_contents = [f"乙台冻结-{stamp}-{i}" for i in range(1, 6)]
+    wa, pa, state_a0 = _new_workspace(ctx, f"甲台顺序-{stamp}", a_contents)
+    wb, pb, state_b0 = _new_workspace(ctx, f"乙台顺序-{stamp}", b_contents)
+
+    s = _migrate_full(ctx, wa, pa, f"vX-{stamp}")
+    check(s["current_epoch"]["number"] == 2 and s["current_epoch"]["version"] == f"vX-{stamp}",
+          "甲台顺序迁移后纪元/版本异常")
+    epoch_a = s["current_epoch"]
+    check(_recs_triples(s) == _recs_triples(state_a0), "甲台已发布纪元记录与冻结时不一致")
+    check(s["migration"]["integrity"] == "ok", "甲台完整性应为 ok")
+
+    s = _migrate_full(ctx, wb, pb, f"vX-{stamp}")
+    check(s["current_epoch"]["number"] == 2 and s["current_epoch"]["version"] == f"vX-{stamp}",
+          "乙台顺序迁移后纪元/版本异常")
+    check(_recs_triples(s) == _recs_triples(state_b0),
+          "乙台新纪元必须保留自身记录的顺序、内容和时间信息")
+    check({c for _, c, _ in _recs_triples(s)}.isdisjoint(set(a_contents)),
+          "乙台不得读到甲台记录，自己的记录不得丢失")
+
+    # 甲台及其已发布纪元在乙台迁移后不得变化
+    _, sa = req(ctx, "GET", f"/api/workspaces/{wa}/state", expect=200)
+    check(sa["current_epoch"] == epoch_a, "乙台迁移不得改变甲台当前纪元")
+    check(_recs_triples(sa) == _recs_triples(state_a0), "乙台迁移不得改写甲台记录")
+
+    # —— 交叠迁移：两工作区迁移在复制/校验/发布之间互相穿插，仍用同一目标版本 ——
+    c_contents = [f"丙台交叠-{stamp}-{i}" for i in range(1, 4)]
+    d_contents = [f"丁台交叠-{stamp}-{i}" for i in range(1, 5)]
+    wc, pc, state_c0 = _new_workspace(ctx, f"丙台交叠-{stamp}", c_contents)
+    wd, pd, state_d0 = _new_workspace(ctx, f"丁台交叠-{stamp}", d_contents)
+    version = f"vY-{stamp}"
+    req(ctx, "POST", f"/api/workspaces/{wc}/migration/start",
+        {"page_id": pc, "target_version": version}, expect=200)
+    req(ctx, "POST", f"/api/workspaces/{wc}/migration/copy",
+        {"page_id": pc, "batch_size": 2}, expect=200)  # 丙只复制 2/3
+    # 丁在丙复制未完时发起同版本迁移，并先复制完、先发布
+    req(ctx, "POST", f"/api/workspaces/{wd}/migration/start",
+        {"page_id": pd, "target_version": version}, expect=200)
+    while True:
+        _, sd = req(ctx, "POST", f"/api/workspaces/{wd}/migration/copy",
+                    {"page_id": pd, "batch_size": 2}, expect=200)
+        if sd["migration"]["phase"] == "validating":
+            break
+    req(ctx, "POST", f"/api/workspaces/{wd}/migration/validate",
+        {"page_id": pd}, expect=200)
+    _, sd = req(ctx, "POST", f"/api/workspaces/{wd}/migration/publish",
+                {"page_id": pd}, expect=200)
+    check(_recs_triples(sd) == _recs_triples(state_d0), "丁台交叠发布记录必须是自身冻结记录")
+    # 丙随后复制完、校验、发布
+    while True:
+        _, sc = req(ctx, "POST", f"/api/workspaces/{wc}/migration/copy",
+                    {"page_id": pc, "batch_size": 2}, expect=200)
+        if sc["migration"]["phase"] == "validating":
+            break
+    req(ctx, "POST", f"/api/workspaces/{wc}/migration/validate",
+        {"page_id": pc}, expect=200)
+    _, sc = req(ctx, "POST", f"/api/workspaces/{wc}/migration/publish",
+                {"page_id": pc}, expect=200)
+    check(_recs_triples(sc) == _recs_triples(state_c0), "丙台交叠发布记录必须是自身冻结记录")
+    _, sd = req(ctx, "GET", f"/api/workspaces/{wd}/state", expect=200)
+    check(_recs_triples(sd) == _recs_triples(state_d0), "先发布的丁台不得被丙台发布影响")
+    check({c for _, c, _ in _recs_triples(sc)}.isdisjoint(set(d_contents)),
+          "交叠迁移后两工作区记录必须完全隔离")
+
+
 # ---------------------------------------------------------------- 场景三
 
 @step("场景三：发布后进程重启，本地恢复的纪元/记录/失效状态一致")
@@ -304,7 +408,7 @@ def main():
     print(f"[verify] 目标 {ctx['base']}", flush=True)
     steps = [build_check, unit_tests, smoke_health, smoke_pages, smoke_api,
              scenario_stale_write_rejected, scenario_interruption_recovery,
-             scenario_restart_consistency]
+             scenario_same_target_isolation, scenario_restart_consistency]
     for s in steps:
         s(ctx)
 

@@ -82,6 +82,10 @@ function render(s) {
     $("migration-info").textContent =
       `目标版本 ${mig.target_version || "—"} · ${cand} · 已复制 ${mig.copied}/${mig.total}` +
       (mig.error ? ` · ${mig.error}` : "");
+    if (mig.phase === "published" && mig.integrity === "affected_foreign_records") {
+      $("migration-info").textContent +=
+        " · ⚠ 该纪元检测到异常（可能由旧版本跨工作区复制导致，自身记录不完整），请重新发起迁移";
+    }
     $("mig-progress").max = Math.max(mig.total, 1);
     $("mig-progress").value = mig.copied;
   } else {
